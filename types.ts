@@ -43,6 +43,25 @@ export interface GraphNode {
   connection_strength: number;
 }
 
+export interface InterestGraphNode {
+  id: string;
+  title: string | null;
+  content: string;
+  tags: string[];
+  source: "manual" | "auto" | "conversation";
+  created_at: string;
+}
+
+export interface InterestGraphEdge {
+  id: string;
+  source_id: string;
+  target_id: string;
+  label: ConnectionLabel;
+  strength: number;
+  reasoning: string | null;
+  created_at: string;
+}
+
 export interface ConnectionAssessment {
   note_id: string;
   label: ConnectionLabel;

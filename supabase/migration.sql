@@ -39,6 +39,10 @@ create index if not exists notes_created_idx on notes (created_at desc);
 create index if not exists connections_source_idx on connections (source_id);
 create index if not exists connections_target_idx on connections (target_id);
 
+-- Cleanup legacy owner-scoping columns/indexes if they exist.
+drop index if exists notes_user_id_idx;
+alter table notes drop column if exists user_id;
+
 -- 5. Auto-update updated_at
 create or replace function update_updated_at()
 returns trigger as $$
@@ -48,6 +52,7 @@ begin
 end;
 $$ language plpgsql;
 
+drop trigger if exists notes_updated_at on notes;
 create trigger notes_updated_at
   before update on notes
   for each row execute function update_updated_at();
@@ -55,6 +60,13 @@ create trigger notes_updated_at
 -- ============================================================
 -- RPC Functions
 -- ============================================================
+
+-- Cleanup legacy overloaded RPCs from older schema versions (user-scoped variant)
+drop function if exists public.match_notes(vector, double precision, integer, text[]);
+drop function if exists public.match_notes(vector, double precision, integer, text[], uuid);
+drop function if exists public.get_connections(uuid, double precision, uuid);
+drop function if exists public.get_connections_deep(uuid, integer, double precision, uuid);
+drop function if exists public.list_tags(integer, uuid);
 
 -- 6. Semantic search with optional tag filter
 create or replace function match_notes(

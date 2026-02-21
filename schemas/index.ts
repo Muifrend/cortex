@@ -122,3 +122,32 @@ export const ListTagsSchema = z
       .describe("Maximum number of tags to return"),
   })
   .strict();
+
+export const VisualizeInterestsSchema = z
+  .object({
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(500)
+      .default(200)
+      .describe("Maximum number of notes to include in the graph"),
+    min_similarity: z
+      .number()
+      .min(0)
+      .max(1)
+      .default(0.3)
+      .describe("Minimum similarity score required for a connection to be shown"),
+    min_strength: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe("Deprecated alias for min_similarity"),
+    tag: z
+      .string()
+      .max(50)
+      .optional()
+      .describe("Optional tag filter; only notes containing this tag are included"),
+  })
+  .strict();

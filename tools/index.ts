@@ -1,4 +1,4 @@
-import { error, object, text, type MCPServer } from "mcp-use/server";
+import { error, object, text, widget, type MCPServer } from "mcp-use/server";
 import {
   DailyDigestSchema,
   DeleteNoteSchema,
@@ -7,6 +7,7 @@ import {
   SaveNoteSchema,
   SearchNotesSchema,
   SummarizeTopicSchema,
+  VisualizeInterestsSchema,
 } from "../schemas/index.js";
 import { AUTO_CONNECT_TOP_K } from "../constants.js";
 import type { ConnectionLabel } from "../types.js";
@@ -20,6 +21,7 @@ import {
   getRecentNotes,
   insertConnection,
   insertNote,
+  getInterestGraph,
   listAllTags,
   searchByEmbedding,
 } from "../services/supabase.js";
@@ -38,33 +40,78 @@ export function registerCortexTools(server: MCPServer): void {
       },
     },
     async ({ title, content, tags, source }) => {
+      const clamp01 = (value: number) => Math.max(0, Math.min(1, value));
+      let note;
+      let embedding: number[];
       try {
         const textToEmbed = title ? `${title}\n${content}` : content;
-        const embedding = await generateEmbedding(textToEmbed);
-        const note = await insertNote(
-          title ?? null,
-          content,
-          tags,
-          source,
-          embedding
+        embedding = await generateEmbedding(textToEmbed);
+        note = await insertNote(title ?? null, content, tags, source, embedding);
+      } catch (err) {
+        return error(
+          `Error saving note: ${err instanceof Error ? err.message : String(err)}`
         );
+      }
 
+      const connectionsCreated: Array<{
+        target_id: string;
+        target_title: string | null;
+        label: ConnectionLabel;
+        strength: number;
+        reasoning: string;
+      }> = [];
+      let connectionInsertFailures = 0;
+      let warning: string | null = null;
+
+      try {
         const similar = await searchByEmbedding(embedding, AUTO_CONNECT_TOP_K);
         const candidates = similar.filter((candidate) => candidate.id !== note.id);
 
-        const connectionsCreated: Array<{
-          target_id: string;
-          target_title: string | null;
-          label: ConnectionLabel;
-          strength: number;
-          reasoning: string;
-        }> = [];
-
         if (candidates.length > 0) {
-          const assessments = await assessConnections(
-            { title: title ?? null, content, tags },
-            candidates
-          );
+          let assessments: Array<{
+            note_id: string;
+            label: ConnectionLabel;
+            strength: number;
+            reasoning: string;
+          }> = [];
+
+          try {
+            assessments = await assessConnections(
+              { title: title ?? null, content, tags },
+              candidates
+            );
+          } catch (assessmentErr) {
+            warning = `Note saved. LLM connection assessment failed, using similarity fallback: ${
+              assessmentErr instanceof Error
+                ? assessmentErr.message
+                : String(assessmentErr)
+            }`;
+            assessments = candidates
+              .filter((candidate) => candidate.similarity >= 0.4)
+              .slice(0, 3)
+              .map((candidate) => ({
+                note_id: candidate.id,
+                label: "related_to" as const,
+                strength: clamp01(candidate.similarity),
+                reasoning:
+                  "Fallback edge created from embedding similarity when LLM assessment was unavailable.",
+              }));
+          }
+
+          // If the model returns an empty/invalid set, keep graph connectivity by
+          // adding similarity-based edges for the strongest neighbors.
+          if (assessments.length === 0) {
+            assessments = candidates
+              .filter((candidate) => candidate.similarity >= 0.5)
+              .slice(0, 2)
+              .map((candidate) => ({
+                note_id: candidate.id,
+                label: "related_to" as const,
+                strength: clamp01(candidate.similarity),
+                reasoning:
+                  "Auto-connected from high embedding similarity (no explicit LLM relationship found).",
+              }));
+          }
 
           for (const assessment of assessments) {
             try {
@@ -84,31 +131,39 @@ export function registerCortexTools(server: MCPServer): void {
                 reasoning: assessment.reasoning,
               });
             } catch (connectionErr) {
+              connectionInsertFailures += 1;
               console.error("Failed to insert connection:", connectionErr);
             }
           }
         }
-
-        return object({
-          note: {
-            id: note.id,
-            title: note.title,
-            content: note.content,
-            tags: note.tags,
-            source: note.source,
-            created_at: note.created_at,
-          },
-          connections: connectionsCreated,
-          message:
-            connectionsCreated.length > 0
-              ? `Saved note and created ${connectionsCreated.length} connection(s).`
-              : "Saved note. No strong connections found.",
-        });
       } catch (err) {
-        return error(
-          `Error saving note: ${err instanceof Error ? err.message : String(err)}`
-        );
+        warning = `Note saved, but semantic connection analysis could not be completed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        console.error("Post-save enrichment failed:", err);
       }
+
+      if (connectionInsertFailures > 0) {
+        const failureMessage = `Failed to persist ${connectionInsertFailures} connection(s). Check server logs for details.`;
+        warning = warning ? `${warning} ${failureMessage}` : failureMessage;
+      }
+
+      return object({
+        note: {
+          id: note.id,
+          title: note.title,
+          content: note.content,
+          tags: note.tags,
+          source: note.source,
+          created_at: note.created_at,
+        },
+        connections: connectionsCreated,
+        warning,
+        message:
+          connectionsCreated.length > 0
+            ? `Saved note and created ${connectionsCreated.length} connection(s).`
+            : "Saved note. No strong connections found.",
+      });
     }
   );
 
@@ -197,6 +252,69 @@ export function registerCortexTools(server: MCPServer): void {
       } catch (err) {
         return error(
           `Error getting related notes: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  );
+
+  server.tool(
+    {
+      name: "cortex_visualize_interests",
+      description:
+        "Visualize your note network as an interactive graph of interests and relationships",
+      schema: VisualizeInterestsSchema,
+      widget: {
+        name: "idea-graph",
+        invoking: "Building your interest graph...",
+        invoked: "Interest graph ready",
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ limit, min_similarity, min_strength, tag }) => {
+      try {
+        const similarityThreshold = min_similarity ?? min_strength ?? 0.3;
+        const { nodes, edges } = await getInterestGraph(
+          limit,
+          similarityThreshold,
+          tag
+        );
+
+        return widget({
+          props: {
+            nodes: nodes.map((node) => ({
+              id: node.id,
+              title: node.title,
+              content: node.content,
+              tags: node.tags,
+              source: node.source,
+              created_at: node.created_at,
+            })),
+            edges: edges.map((edge) => ({
+              id: edge.id,
+              source_id: edge.source_id,
+              target_id: edge.target_id,
+              label: edge.label,
+              strength: edge.strength,
+              reasoning: edge.reasoning,
+              created_at: edge.created_at,
+            })),
+            filters: {
+              requested_limit: limit,
+              min_similarity: similarityThreshold,
+              tag: tag ?? null,
+            },
+          },
+          output: text(
+            `Loaded ${nodes.length} concepts and ${edges.length} connections above similarity ${similarityThreshold.toFixed(2)}.`
+          ),
+        });
+      } catch (err) {
+        return error(
+          `Error visualizing interests: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     }

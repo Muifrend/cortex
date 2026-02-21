@@ -49,9 +49,15 @@ export async function assessConnections(
   newNote: { title: string | null; content: string; tags: string[] },
   candidates: SimilarNote[]
 ): Promise<ConnectionAssessment[]> {
-  const openai = getOpenAI();
-  if (!openai || candidates.length === 0) {
+  if (candidates.length === 0) {
     return [];
+  }
+
+  const openai = getOpenAI();
+  if (!openai) {
+    throw new Error(
+      "Missing OPENAI_API_KEY; cannot run connection assessment."
+    );
   }
 
   const candidateList = candidates
@@ -105,7 +111,8 @@ Return ONLY a JSON array. Include only genuinely meaningful relationships:
           VALID_LABELS.has(item.label)
       );
   } catch (err) {
-    console.error("Connection assessment failed:", err);
-    return [];
+    throw new Error(
+      `Connection assessment failed: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 }
